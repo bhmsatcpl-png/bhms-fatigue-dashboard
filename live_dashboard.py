@@ -123,4 +123,97 @@ def fetch_and_compute_pipeline(url, cat_num):
     df['Trend'] = df['TempCorrected'].rolling(window=96, center=True).mean().ffill().bfill()
     df['Detrended'] = df['TempCorrected'] - df['Trend']
 
-    dt = 15 *
+    dt = 15 * 60  # fixed line
+    fs = 1 / dt
+    cutoff = 1 / (6 * 3600)
+    b, a = butter(4, cutoff / (fs / 2), btype='high')
+    df['LiveLoad'] = filtfilt(b, a, df['Detrended'])
+    
+    stress_history = (df['LiveLoad'] * 1e-6) * YOUNGS_MODULUS
+    
+    cycles = list(rainflow.extract_cycles(stress_history.to_numpy()))
+    time_delta = (df['Datetime'].iloc[-1] - df['Datetime'].iloc[0]).total_seconds()
+    duration_hours = time_delta / 3600.0
+    
+    threshold_stress = CATEGORY_DATABASE[cat_num]['threshold']
+    sn_c = CATEGORY_DATABASE[cat_num]['constant_C']
+    
+    cycle_records = []
+    total_damage = 0.0
+    ignored_cycles = 0
+    
+    for rng, mean, count, _, _ in cycles:
+        rng_corrected = rng / (1.0 - (mean / UTS)) if mean < UTS else rng
+        if rng_corrected < threshold_stress:
+            ignored_cycles += 1
+            continue
+            
+        N_allowed = sn_c / (rng_corrected ** SN_M)
+        damage_i = count / N_allowed
+        total_damage += damage_i
+        
+        cycle_records.append({
+            'Goodman_Corrected_Range_MPa': rng_corrected,
+            'Cycle_Count': count,
+            'Damage_Contribution_Di': damage_i
+        })
+        
+    rul_hours = max(0.0, (duration_hours / total_damage) - duration_hours) if total_damage > 0 else float('inf')
+    rul_years = rul_hours / (24.0 * 365.25) if rul_hours != float('inf') else float('inf')
+    
+    summary_metrics = {
+        "cat_num": cat_num,
+        "threshold": threshold_stress,
+        "time_delta": time_delta,
+        "cycles_pass": len(cycle_records),
+        "cycles_fail": ignored_cycles,
+        "total_damage": total_damage,
+        "rul_hours": "Infinite" if rul_hours == float('inf') else round(rul_hours, 2),
+        "rul_years": "Infinite" if rul_years == float('inf') else round(rul_years, 3)
+    }
+    
+    return {"df": df, "summary": summary_metrics, "spectra": pd.DataFrame(cycle_records)}, None
+
+results, error_msg = fetch_and_compute_pipeline(cloud_link_input, selected_cat)
+
+if error_msg:
+    st.error(error_msg)
+    st.info("💡 Configuration Check: Input your live Google Drive link on the left panel to load the systems.")
+else:
+    df_live = results["df"]
+    metrics = results["summary"]
+    spectra_df = results["spectra"]
+
+    st.markdown("---")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(label="Structural Classification", value=f"FAT-{metrics['cat_num']}", delta=f"Threshold: {metrics['threshold']} MPa", delta_color="inverse")
+    with col2:
+        d_val = metrics['total_damage']
+        val_str = f"{d_val:.2e}" if (0 < d_val < 0.001) else f"{d_val:.5f}"
+        st.metric(label="Cumulative Damage (D)", value=val_str)
+    with col3:
+        st.metric(label="Remaining Fatigue Life", value=f"{metrics['rul_years']} Years", delta=f"{metrics['rul_hours']} Hours Total")
+    with col4:
+        st.metric(label="Active Load Cycles Logged", value=metrics['cycles_pass'])
+
+    st.markdown(f"### 📈 Live Dynamic Working Load Stress History (Refreshes every {auto_refresh_sec}s)")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_live['Datetime'], y=df_live['LiveLoad'], mode='lines', name='Live Dynamic Stress (MPa)', line=dict(color='#2563EB', width=1.5)))
+    fig.update_layout(xaxis_title="Measurement Timeline", yaxis_title="Stress (MPa)", hovermode="x unified", margin=dict(l=40, r=40, t=10, b=40), height=400, template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### 📋 Live Telemetry Log (Latest Records)")
+        st.dataframe(df_live.tail(100).sort_values('Datetime', ascending=False), height=250, use_container_width=True)
+    with right:
+        st.markdown("### 📊 Rainflow Range Count Distribution Histogram")
+        if not spectra_df.empty:
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(x=spectra_df['Goodman_Corrected_Range_MPa'], nbinsx=15, marker_color='#DC2626', opacity=0.75))
+            fig_hist.update_layout(xaxis_title="Goodman Corrected Range (MPa)", yaxis_title="Frequency Count", margin=dict(l=40, r=40, t=10, b=40), height=250, template="plotly_white")
+            st.plotly_chart(fig_hist, use_container_width=True)
+        else:
+            st.warning("No stress cycles have crossed the structural detail threshold yet.")
