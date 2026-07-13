@@ -123,7 +123,7 @@ def fetch_and_compute_pipeline(url, cat_num):
     df['Trend'] = df['TempCorrected'].rolling(window=96, center=True).mean().ffill().bfill()
     df['Detrended'] = df['TempCorrected'] - df['Trend']
 
-    dt = 15 * 60
+    dt = 15 * 60  #fixed line
     fs = 1 / dt
     cutoff = 1 / (6 * 3600)
     b, a = butter(4, cutoff / (fs / 2), btype='high')
