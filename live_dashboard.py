@@ -32,7 +32,7 @@ st.markdown("<h3 style='text-align: center; color: #4B5563; margin-bottom: 30px;
 # -------------------------------------------------------------
 st.sidebar.markdown("## 🌐 Live Data Feed Configuration")
 
-DEFAULT_CLOUD_URL = "https://docs.google.com/spreadsheets/d/1X-YOUR_REAL_SHEET_ID_HERE/edit?usp=sharing"
+DEFAULT_CLOUD_URL = "https://docs.google.com/spreadsheets/d/1A2B3C4D5E6F7G8H9I0J/edit?usp=sharing"
 
 cloud_link_input = st.sidebar.text_input(
     "Cloud Excel/CSV Shared Link:", 
