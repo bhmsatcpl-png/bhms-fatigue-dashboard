@@ -1,0 +1,318 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+from scipy.signal import medfilt, savgol_filter, butter, filtfilt
+from sklearn.linear_model import LinearRegression
+import rainflow
+import plotly.graph_objects as go
+
+# =============================================================
+# CONSTANTS & METADATA CONFIGURATION
+# =============================================================
+YOUNGS_MODULUS = 210000  # MPa (Steel)
+UTS = 460  # MPa
+SN_M = 3.0  # Fatigue strength exponent
+
+DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1TcwXwOIUR2mIYhgtBZ3P4Yb7MCJMzsua/edit?usp=sharing"
+
+CATEGORY_DATABASE = {
+    160: {"name": "Non-welded base metal / rolled profiles", "threshold": 40.0, "constant_C": 8.19e12},
+    125: {"name": "Continuous longitudinal welds", "threshold": 32.0, "constant_C": 3.91e12},
+    90:  {"name": "Transverse butt welds in plate configurations", "threshold": 23.0, "constant_C": 1.46e12},
+    71:  {"name": "Attachments / Welded gussets on flanges", "threshold": 18.0, "constant_C": 7.16e11},
+    50:  {"name": "Load-carrying cruciform joints", "threshold": 13.0, "constant_C": 2.50e11}
+}
+
+# Streamlit App UI Branding
+st.set_page_config(page_title="Cloud-Linked Fatigue Dashboard", page_icon="🏗️", layout="wide")
+st.markdown("<h1 style='text-align: center; color: #1E3A8A;'>🏗️ Real-Time Bridge Health Monitoring</h1>", unsafe_allow_html=True)
+st.markdown("<h3 style='text-align: center; color: #4B5563; margin-bottom: 30px;'>Automated Multi-Sensor Fatigue Life Dashboard</h3>", unsafe_allow_html=True)
+
+# -------------------------------------------------------------
+# SIDEBAR CONFIGURATION
+# -------------------------------------------------------------
+st.sidebar.markdown("## 🌐 Data Source Configuration")
+
+data_source = st.sidebar.radio("Choose Data Source:", ["Google Sheets Link", "Upload Local Files"])
+
+uploaded_files = []
+google_sheet_url = ""
+
+if data_source == "Google Sheets Link":
+    google_sheet_url = st.sidebar.text_input(
+        "Paste Shared Google Sheets Link:",
+        value=DEFAULT_GSHEET_URL,
+        placeholder="https://docs.google.com/spreadsheets/d/.../edit?usp=sharing"
+    )
+else:
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload Strain Gauge Files (Excel/CSV):",
+        type=["xlsx", "csv"],
+        accept_multiple_files=True
+    )
+
+selected_cat = st.sidebar.selectbox(
+    "Select Structural Eurocode Detail Category:",
+    options=list(CATEGORY_DATABASE.keys()),
+    format_func=lambda x: f"Category {x} ({CATEGORY_DATABASE[x]['name']})"
+)
+
+# Button to manually invalidate the cache and pull fresh spreadsheet data
+if data_source == "Google Sheets Link":
+    if st.sidebar.button("🔄 Refresh Google Sheets Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+def convert_to_download_url(url):
+    if "docs.google.com/spreadsheets" in url:
+        if "/edit" in url:
+            return url.split("/edit")[0] + "/export?format=xlsx"
+    return url
+
+# OPTIMIZED: Vectorized Pandas Hampel filter replacing the slow row-by-row for-loop
+def hampel_filter_vectorized(series_np, window=5, n=3):
+    series = pd.Series(series_np)
+    rolling_median = series.rolling(window=2*window+1, center=True).median()
+    rolling_mad = 1.4826 * (series - rolling_median).abs().rolling(window=2*window+1, center=True).median()
+    
+    # Identify outliers using vector logic
+    outliers = (series - rolling_median).abs() > (n * rolling_mad)
+    
+    # Fill outliers with rolling median value, fallback to originals for edge boundaries
+    filtered_series = series.copy()
+    filtered_series[outliers] = rolling_median[outliers]
+    return filtered_series.ffill().bfill().to_numpy()
+
+# -------------------------------------------------------------
+# PIPELINE EVALUATION FUNCTION
+# -------------------------------------------------------------
+def compute_sensor_pipeline(df, sensor_name, cat_num):
+    try:
+        df.columns = df.columns.str.strip()
+        
+        rename_dict = {}
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower in ['date time (utc+05:30)', 'datetime', 'date time', 'timestamp', 'time']:
+                rename_dict[col] = 'Datetime'
+            elif col_lower in ['strain (microstrain)', 'strain_raw', 'rawstrain', 'strain']:
+                rename_dict[col] = 'RawStrain'
+            elif col_lower in ['temperature (c)', 'temperature', 'temp', 't']:
+                rename_dict[col] = 'Temperature'
+                
+        df = df.rename(columns=rename_dict)
+        
+        for req_col in ['Datetime', 'RawStrain', 'Temperature']:
+            if req_col not in df.columns:
+                return None, f"Missing target columns in '{sensor_name}'."
+
+        df['Datetime'] = pd.to_datetime(df['Datetime'])
+        df = df.sort_values('Datetime').reset_index(drop=True)
+        
+        df['RawStrain'] = pd.to_numeric(df['RawStrain'], errors='coerce').interpolate()
+        df['Temperature'] = pd.to_numeric(df['Temperature'], errors='coerce').interpolate()
+        
+        df = df[(df['Temperature'] > -20) & (df['Temperature'] < 80)].copy().reset_index(drop=True)
+
+        df['STRAIN'] = df['RawStrain']
+        df['Digits'] = df['RawStrain'] * 0.1  
+        df['Median'] = medfilt(df['RawStrain'], kernel_size=3)
+        df['Hampel'] = hampel_filter_vectorized(df['Median'].values, window=5, n=3)
+        df['Smooth'] = savgol_filter(df['Hampel'], 11, 2)
+
+        X_reg = df[['Temperature']]
+        y_reg = df['Smooth']
+        model = LinearRegression().fit(X_reg, y_reg)
+        df['ThermalStrain'] = model.predict(X_reg)
+        df['TempCorrected'] = df['Smooth'] - df['ThermalStrain']
+
+        df['Trend'] = df['TempCorrected'].rolling(window=96, center=True).mean().ffill().bfill()
+        df['Detrended'] = df['TempCorrected'] - df['Trend']
+
+        dt = 15 * 60  
+        fs = 1 / dt
+        cutoff = 1 / (6 * 3600)
+        b, a = butter(4, cutoff / (fs / 2), btype='high')
+        df['LiveLoad'] = filtfilt(b, a, df['Detrended'])
+        
+        stress_history = (df['LiveLoad'] * 1e-6) * YOUNGS_MODULUS
+        
+        cycles = list(rainflow.extract_cycles(stress_history.to_numpy()))
+        time_delta = (df['Datetime'].iloc[-1] - df['Datetime'].iloc[0]).total_seconds()
+        duration_hours = time_delta / 3600.0
+        
+        threshold_stress = CATEGORY_DATABASE[cat_num]['threshold']
+        sn_c = CATEGORY_DATABASE[cat_num]['constant_C']
+        
+        cycle_records = []
+        total_damage = 0.0
+        ignored_cycles = 0
+        
+        for rng, mean, count, _, _ in cycles:
+            rng_corrected = rng / (1.0 - (mean / UTS)) if mean < UTS else rng
+            if rng_corrected < threshold_stress:
+                ignored_cycles += 1
+                continue
+                
+            N_allowed = sn_c / (rng_corrected ** SN_M)
+            damage_i = count / N_allowed
+            total_damage += damage_i
+            
+            cycle_records.append({
+                'Goodman_Corrected_Range_MPa': rng_corrected,
+                'Cycle_Count': count,
+                'Damage_Contribution_Di': damage_i
+            })
+            
+        rul_hours = max(0.0, (duration_hours / total_damage) - duration_hours) if total_damage > 0 else float('inf')
+        rul_years = rul_hours / (24.0 * 365.25) if rul_hours != float('inf') else float('inf')
+        
+        summary_metrics = {
+            "sensor_name": sensor_name,
+            "cat_num": cat_num,
+            "threshold": threshold_stress,
+            "time_delta": time_delta,
+            "cycles_pass": len(cycle_records),
+            "cycles_fail": ignored_cycles,
+            "total_damage": total_damage,
+            "rul_hours": rul_hours,
+            "rul_years": rul_years
+        }
+        
+        return {"df": df, "summary": summary_metrics, "spectra": pd.DataFrame(cycle_records)}, None
+    except Exception as e:
+        return None, f"Processing Error: {str(e)}"
+
+# -------------------------------------------------------------
+# HIGH PERFORMANCE CACHED LOADING LAYER
+# -------------------------------------------------------------
+@st.cache_data(show_spinner="Downloading and processing fleet telemetry matrices...")
+def load_and_compute_all_data(source_type, url_link, files_list, cat_num):
+    results = {}
+    errors = []
+    if source_type == "Google Sheets Link" and url_link:
+        download_url = convert_to_download_url(url_link)
+        try:
+            xls = pd.ExcelFile(download_url)
+            for sheet_name in xls.sheet_names:
+                df_sheet = pd.read_excel(xls, sheet_name=sheet_name)
+                res, err = compute_sensor_pipeline(df_sheet, sheet_name, cat_num)
+                if err:
+                    errors.append((sheet_name, err))
+                else:
+                    results[sheet_name] = res
+        except Exception as e:
+            errors.append(("Google Sheets Connection", str(e)))
+    elif source_type == "Upload Local Files" and files_list:
+        for file in files_list:
+            try:
+                if file.name.endswith(".xlsx"):
+                    df_file = pd.read_excel(file)
+                else:
+                    df_file = pd.read_csv(file)
+                sensor_name = file.name.split('.')[0]
+                res, err = compute_sensor_pipeline(df_file, sensor_name, cat_num)
+                if err:
+                    errors.append((sensor_name, err))
+                else:
+                    results[sensor_name] = res
+            except Exception as e:
+                errors.append((file.name, str(e)))
+    return results, errors
+
+# Trigger cached network download execution layer
+all_results, failed_sensors = load_and_compute_all_data(data_source, google_sheet_url, uploaded_files, selected_cat)
+
+if not all_results and not failed_sensors:
+    st.info("💡 Configuration active. Awaiting data source synchronization...")
+
+if failed_sensors:
+    for sname, err in failed_sensors:
+        st.error(f"Error processing sensor '{sname}': {err}")
+
+# Render Dashboard
+if all_results:
+    summary_rows = []
+    min_life_val = float('inf')
+    critical_sensor = "None"
+
+    for sname, data in all_results.items():
+        years = data['summary']['rul_years']
+        hours = data['summary']['rul_hours']
+        
+        if years < min_life_val:
+            min_life_val = years
+            critical_sensor = sname
+            
+        display_years = "Infinite" if years == float('inf') else round(years, 2)
+        display_hours = "Infinite" if hours == float('inf') else round(hours, 1)
+        
+        summary_rows.append({
+            "Sensor Name": sname,
+            "Remaining Life (Years)": display_years,
+            "Remaining Life (Hours)": display_hours,
+            "Cumulative Damage (D)": f"{data['summary']['total_damage']:.2e}" if (0 < data['summary']['total_damage'] < 0.001) else f"{data['summary']['total_damage']:.5f}",
+            "Logged Active Cycles": data['summary']['cycles_pass']
+        })
+    summary_df = pd.DataFrame(summary_rows)
+
+    st.markdown("## 📊 Sensor Fleet Fatigue Summary")
+    
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        st.metric(label="Total Sensors Evaluated", value=len(all_results))
+    with col_f2:
+        st.metric(label="Most Critical Remaining Life", value=f"{round(min_life_val, 2) if min_life_val != float('inf') else 'Infinite'} Years")
+    with col_f3:
+        st.metric(label="Highest Risk Location", value=critical_sensor)
+        
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    st.markdown("## 🔍 Individual Sensor In-depth Analysis")
+    selected_sensor = st.selectbox(
+        "Select Sensor to inspect details:",
+        options=list(all_results.keys())
+    )
+
+    sensor_data = all_results[selected_sensor]
+    df_live = sensor_data["df"]
+    metrics = sensor_data["summary"]
+    spectra_df = sensor_data["spectra"]
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(label="Structural Classification", value=f"FAT-{metrics['cat_num']}", delta=f"Threshold: {metrics['threshold']} MPa", delta_color="inverse")
+    with col2:
+        d_val = metrics['total_damage']
+        val_str = f"{d_val:.2e}" if (0 < d_val < 0.001) else f"{d_val:.5f}"
+        st.metric(label="Cumulative Damage (D)", value=val_str)
+    with col3:
+        years_ind = metrics['rul_years']
+        hours_ind = metrics['rul_hours']
+        st.metric(label="Remaining Fatigue Life", value=f"{'Infinite' if years_ind == float('inf') else round(years_ind, 3)} Years", delta=f"{'Infinite' if hours_ind == float('inf') else round(hours_ind, 1)} Hours Total")
+    with col4:
+        st.metric(label="Active Load Cycles Logged", value=metrics['cycles_pass'])
+
+    st.markdown(f"### 📈 Live Dynamic Working Load Stress History: **{selected_sensor}**")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_live['Datetime'], y=df_live['LiveLoad'], mode='lines', name='Live Dynamic Stress (MPa)', line=dict(color='#2563EB', width=1.5)))
+    fig.update_layout(xaxis_title="Measurement Timeline", yaxis_title="Stress (MPa)", hovermode="x unified", margin=dict(l=40, r=40, t=10, b=40), height=400, template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    left, right = st.columns(2)
+    with left:
+        st.markdown(f"### 📋 Live Telemetry Log (Latest Records: {selected_sensor})")
+        st.dataframe(df_live.tail(100).sort_values('Datetime', ascending=False), height=250, use_container_width=True)
+    with right:
+        st.markdown(f"### 📊 Rainflow Range Count Distribution Histogram ({selected_sensor})")
+        if not spectra_df.empty:
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Histogram(x=spectra_df['Goodman_Corrected_Range_MPa'], nbinsx=15, marker_color='#DC2626', opacity=0.75))
+            fig_hist.update_layout(xaxis_title="Goodman Corrected Range (MPa)", yaxis_title="Frequency Count", margin=dict(l=40, r=40, t=10, b=40), height=250, template="plotly_white")
+            st.plotly_chart(fig_hist, use_container_width=True)
+        else:
+            st.warning("No stress cycles have crossed the structural detail threshold yet.")
