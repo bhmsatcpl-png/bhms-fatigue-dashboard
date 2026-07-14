@@ -14,6 +14,9 @@ YOUNGS_MODULUS = 210000  # MPa (Steel)
 UTS = 460  # MPa
 SN_M = 3.0  # Fatigue strength exponent
 
+# Default spreadsheet link provided by user
+DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1TcwXwOIUR2mIYhgtBZ3P4Yb7MCJMzsua/edit?usp=sharing"
+
 CATEGORY_DATABASE = {
     160: {"name": "Non-welded base metal / rolled profiles", "threshold": 40.0, "constant_C": 8.19e12},
     125: {"name": "Continuous longitudinal welds", "threshold": 32.0, "constant_C": 3.91e12},
@@ -40,6 +43,7 @@ google_sheet_url = ""
 if data_source == "Google Sheets Link":
     google_sheet_url = st.sidebar.text_input(
         "Paste Shared Google Sheets Link:",
+        value=DEFAULT_GSHEET_URL,
         placeholder="https://docs.google.com/spreadsheets/d/.../edit?usp=sharing",
         help="Make sure the Google Sheet sharing setting is set to 'Anyone with the link can view'."
     )
@@ -79,13 +83,11 @@ def hampel_filter_notebook(series, window=5, n=3):
 # -------------------------------------------------------------
 def compute_sensor_pipeline(df, sensor_name, cat_num):
     try:
-        # Strip trailing/leading spaces from columns
         df.columns = df.columns.str.strip()
         
         rename_dict = {}
         for col in df.columns:
             col_lower = col.lower()
-            # Explicitly match your exact headers from the Excel sheet
             if col_lower in ['date time (utc+05:30)', 'datetime', 'date time', 'timestamp', 'time']:
                 rename_dict[col] = 'Datetime'
             elif col_lower in ['strain (microstrain)', 'strain_raw', 'rawstrain', 'strain']:
@@ -95,10 +97,9 @@ def compute_sensor_pipeline(df, sensor_name, cat_num):
                 
         df = df.rename(columns=rename_dict)
         
-        # Verify required columns are present after renaming
         for req_col in ['Datetime', 'RawStrain', 'Temperature']:
             if req_col not in df.columns:
-                return None, f"Required columns missing in '{sensor_name}'. Expecting: 'Date Time (UTC+05:30)', 'Temperature (C)', 'Strain (microstrain)'. Found: {list(df.columns)}"
+                return None, f"Required columns missing in '{sensor_name}'. Expecting: 'Date Time (UTC+05:30)', 'Temperature (C)', 'Strain (microstrain)'."
 
         df['Datetime'] = pd.to_datetime(df['Datetime'])
         df = df.sort_values('Datetime').reset_index(drop=True)
@@ -169,8 +170,8 @@ def compute_sensor_pipeline(df, sensor_name, cat_num):
             "cycles_pass": len(cycle_records),
             "cycles_fail": ignored_cycles,
             "total_damage": total_damage,
-            "rul_hours": "Infinite" if rul_hours == float('inf') else round(rul_hours, 2),
-            "rul_years": "Infinite" if rul_years == float('inf') else round(rul_years, 3)
+            "rul_hours": rul_hours,
+            "rul_years": rul_years
         }
         
         return {"df": df, "summary": summary_metrics, "spectra": pd.DataFrame(cycle_records)}, None
@@ -214,39 +215,55 @@ elif data_source == "Upload Local Files" and uploaded_files:
         except Exception as e:
             failed_sensors.append((file.name, str(e)))
 
-# Show helper prompts if no data is loaded
 if not all_results and not failed_sensors:
-    if data_source == "Google Sheets Link":
-        st.info("💡 Paste your shared Google Sheets link in the left panel to begin cloud-synchronized monitoring.")
-    else:
-        st.info("💡 Upload one or more strain gauge files (.xlsx or .csv) in the left panel to begin manual inspection.")
+    st.info("💡 Synchronizing workspace with Google Sheets...")
 
-# Display failures if any
 if failed_sensors:
     for sname, err in failed_sensors:
         st.error(f"Error processing sensor/tab '{sname}': {err}")
 
 # Render Dashboard if results exist
 if all_results:
-    # Build comparison summary dataframe
     summary_rows = []
+    min_life_val = float('inf')
+    critical_sensor = "None"
+
     for sname, data in all_results.items():
+        years = data['summary']['rul_years']
+        hours = data['summary']['rul_hours']
+        
+        if years < min_life_val:
+            min_life_val = years
+            critical_sensor = sname
+            
+        display_years = "Infinite" if years == float('inf') else round(years, 2)
+        display_hours = "Infinite" if hours == float('inf') else round(hours, 1)
+        
         summary_rows.append({
             "Sensor Name": sname,
+            "Remaining Life (Years)": display_years,
+            "Remaining Life (Hours)": display_hours,
             "Cumulative Damage (D)": f"{data['summary']['total_damage']:.2e}" if (0 < data['summary']['total_damage'] < 0.001) else f"{data['summary']['total_damage']:.5f}",
-            "Remaining Life (Years)": data['summary']['rul_years'],
-            "Remaining Life (Hours)": data['summary']['rul_hours'],
             "Logged Active Cycles": data['summary']['cycles_pass']
         })
     summary_df = pd.DataFrame(summary_rows)
 
-    # 1. Master Multi-Sensor Comparison Panel
+    # FLEET BALANCED LIFE OVERVIEW PANEL
     st.markdown("## 📊 Sensor Fleet Fatigue Summary")
+    
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        st.metric(label="Total Sensors Evaluated", value=len(all_results))
+    with col_f2:
+        st.metric(label="Most Critical Remaining Life", value=f"{round(min_life_val, 2) if min_life_val != float('inf') else 'Infinite'} Years")
+    with col_f3:
+        st.metric(label="Highest Risk Location", value=critical_sensor)
+        
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     st.markdown("---")
 
-    # 2. Detail Analysis Dropdown for Individual Sensors
+    # DETAIL ANALYSIS DROPDOWN FOR INDIVIDUAL SENSORS
     st.markdown("## 🔍 Individual Sensor In-depth Analysis")
     selected_sensor = st.selectbox(
         "Select Sensor to inspect details:",
@@ -258,7 +275,6 @@ if all_results:
     metrics = sensor_data["summary"]
     spectra_df = sensor_data["spectra"]
 
-    # Metric cards
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric(label="Structural Classification", value=f"FAT-{metrics['cat_num']}", delta=f"Threshold: {metrics['threshold']} MPa", delta_color="inverse")
@@ -267,18 +283,18 @@ if all_results:
         val_str = f"{d_val:.2e}" if (0 < d_val < 0.001) else f"{d_val:.5f}"
         st.metric(label="Cumulative Damage (D)", value=val_str)
     with col3:
-        st.metric(label="Remaining Fatigue Life", value=f"{metrics['rul_years']} Years", delta=f"{metrics['rul_hours']} Hours Total")
+        years_ind = metrics['rul_years']
+        hours_ind = metrics['rul_hours']
+        st.metric(label="Remaining Fatigue Life", value=f"{'Infinite' if years_ind == float('inf') else round(years_ind, 3)} Years", delta=f"{'Infinite' if hours_ind == float('inf') else round(hours_ind, 1)} Hours Total")
     with col4:
         st.metric(label="Active Load Cycles Logged", value=metrics['cycles_pass'])
 
-    # Time-series graph
     st.markdown(f"### 📈 Live Dynamic Working Load Stress History: **{selected_sensor}**")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df_live['Datetime'], y=df_live['LiveLoad'], mode='lines', name='Live Dynamic Stress (MPa)', line=dict(color='#2563EB', width=1.5)))
     fig.update_layout(xaxis_title="Measurement Timeline", yaxis_title="Stress (MPa)", hovermode="x unified", margin=dict(l=40, r=40, t=10, b=40), height=400, template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Log & Histogram
     st.markdown("---")
     left, right = st.columns(2)
     with left:
